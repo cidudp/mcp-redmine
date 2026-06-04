@@ -1,4 +1,4 @@
-import os, yaml, pathlib, json, uuid
+import os, yaml, pathlib, json, uuid, base64
 from urllib.parse import urljoin
 from typing import Optional
 
@@ -344,16 +344,29 @@ mcp = FastMCP(
 get_logger(__name__).info(f"Starting MCP Redmine version {VERSION}")
 
 @mcp.tool(description="""
-Make a request to the Redmine API
+Execute a direct request to the Redmine REST API.
+
+This is the main tool for interacting with Redmine. Use it to create, read, update, 
+or delete any Redmine resource (issues, projects, users, time entries, etc.).
 
 Args:
-    path: API endpoint path (e.g. '/issues.json')
-    method: HTTP method to use (default: 'get')
-    data: Dictionary for request body (for POST/PUT)
-    params: Dictionary for query parameters
+    path: API endpoint path (e.g. '/issues.json', '/projects/myproject/issues.json')
+    method: HTTP method - 'get', 'post', 'put', 'patch', or 'delete' (default: 'get')
+    data: Request body as dictionary. Used for POST/PUT/PATCH to create or update resources.
+          Example for creating issue: {{'issue': {{'project_id': 1, 'subject': 'Bug title'}}}}
+    params: Query parameters as dictionary. Used for filtering, pagination, includes.
+          Example: {{'status_id': 'open', 'limit': 25, 'include': 'attachments,journals'}}
 
 Returns:
-    str: YAML string containing response status code, body and error message
+    str: Response with status_code, body (JSON data from Redmine), and error message if any.
+
+Common endpoints:
+    - GET /issues.json - List issues
+    - GET /issues/{{id}}.json - Get single issue
+    - POST /issues.json - Create issue
+    - PUT /issues/{{id}}.json - Update issue
+    - GET /projects.json - List projects
+    - GET /users/current.json - Get current user info
 
 {}""".format(REDMINE_REQUEST_INSTRUCTIONS).strip())
     
@@ -362,25 +375,45 @@ def redmine_request(path: str, method: str = 'get', data: dict = None, params: d
 
 @mcp.tool()
 def redmine_paths_list() -> str:
-    """Return a list of available API paths from OpenAPI spec
+    """
+    List all available Redmine API endpoints from the OpenAPI specification.
     
-    Retrieves all endpoint paths defined in the Redmine OpenAPI specification. Remember that you can use the
-    redmine_paths_info tool to get the full specfication for a path.
+    Use this tool to discover what API endpoints are available. Once you find a relevant 
+    endpoint, use redmine_paths_info to get detailed documentation about parameters, 
+    request body format, and response structure.
     
     Returns:
-        str: YAML string containing a list of path templates (e.g. '/issues.json')
+        str: List of API path templates (e.g. '/issues.json', '/projects/{project_id}/memberships.json')
+    
+    Example workflow:
+        1. Call redmine_paths_list() to see available endpoints
+        2. Call redmine_paths_info(['/issues.json']) to get details
+        3. Call redmine_request('/issues.json', 'get', params={'status_id': 'open'}) to execute
     """
     return format_response(list(SPEC['paths'].keys()))
 
 @mcp.tool()
 def redmine_paths_info(path_templates: list) -> str:
-    """Get full path information for given path templates
+    """
+    Get detailed OpenAPI documentation for specific Redmine API endpoints.
+    
+    Returns complete specification including HTTP methods, parameters, request body 
+    schema, and response format for each requested endpoint.
     
     Args:
-        path_templates: List of path templates (e.g. ['/issues.json', '/projects.json'])
+        path_templates: List of endpoint paths to get info for.
+                       Example: ['/issues.json', '/time_entries.json']
         
     Returns:
-        str: YAML string containing API specifications for the requested paths
+        str: Full API specification for each path including:
+             - Supported HTTP methods (GET, POST, PUT, DELETE)
+             - Query parameters and their types
+             - Request body schema for POST/PUT
+             - Response body schema
+    
+    Example:
+        redmine_paths_info(['/issues/{issue_id}.json']) 
+        -> Returns how to get, update, or delete an issue
     """
     info = {}
     for path in path_templates:
@@ -392,15 +425,20 @@ def redmine_paths_info(path_templates: list) -> str:
 @mcp.tool()
 def redmine_upload(file_path: str, description: str = None) -> str:
     """
-    Upload a file to Redmine and get a token for attachment
+    Upload a file from the server filesystem to Redmine (for server-side automation).
+    
+    NOTE: This tool requires REDMINE_ALLOWED_DIRECTORIES to be configured and only works 
+    with files on the MCP server's filesystem. For uploading from Claude, use 
+    redmine_attachment_add() which accepts base64 content instead.
 
     Args:
-        file_path: Fully qualified path to the file to upload (must be within REDMINE_ALLOWED_DIRECTORIES)
-        description: Optional description for the file
+        file_path: Absolute path to file on server (must be within REDMINE_ALLOWED_DIRECTORIES)
+        description: Optional description for the attachment
 
     Returns:
-        str: YAML string containing response status code, body and error message
-             The body contains the attachment token
+        str: Upload token in body.upload.token - use this to attach to an issue:
+             redmine_request('/issues/{id}.json', 'put', 
+                {'issue': {'uploads': [{'token': '<token>', 'filename': '<name>'}]}})
     """
     error, path = validate_path(file_path, must_exist=True)
     if error:
@@ -423,16 +461,18 @@ def redmine_upload(file_path: str, description: str = None) -> str:
 @mcp.tool()
 def redmine_download(attachment_id: int, save_path: str, filename: str = None) -> str:
     """
-    Download an attachment from Redmine and save it to a local file
+    Download an attachment from Redmine to the server filesystem (for server-side automation).
+    
+    NOTE: This tool saves files to the MCP server's filesystem. For getting file content 
+    directly in Claude, use redmine_attachment_get() which returns base64 content instead.
 
     Args:
-        attachment_id: The ID of the attachment to download
-        save_path: Fully qualified path where the file should be saved to (must be within REDMINE_ALLOWED_DIRECTORIES)
-        filename: Optional filename to use for the attachment. If not provided,
-                 will be determined from attachment data or URL
+        attachment_id: The ID of the attachment (get this from redmine_issue_attachments)
+        save_path: Absolute path on server where to save (must be within REDMINE_ALLOWED_DIRECTORIES)
+        filename: Optional custom filename. If not provided, uses original filename from Redmine.
 
     Returns:
-        str: YAML string containing download status, file path, and any error messages
+        str: saved_to path and filename on success, or error message if failed.
     """
     error, path = validate_path(save_path, must_exist=False)
     if error:
@@ -461,6 +501,207 @@ def redmine_download(attachment_id: int, save_path: str, filename: str = None) -
             f.write(response["body"])
 
         return format_response({"status_code": 200, "body": {"saved_to": str(path), "filename": filename}, "error": ""})
+    except Exception as e:
+        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
+
+@mcp.tool()
+def redmine_issue_attachments(issue_id: int) -> str:
+    """
+    List all attachments for a Redmine issue.
+    
+    Use this to discover what files are attached to an issue before downloading them.
+
+    Args:
+        issue_id: The Redmine issue ID (the number, e.g. 1234)
+
+    Returns:
+        str: List of attachments, each containing:
+             - id: Attachment ID (use this with redmine_attachment_get to download)
+             - filename: Original filename
+             - filesize: Size in bytes
+             - content_type: MIME type (e.g. 'application/pdf', 'image/png')
+             - description: User-provided description
+             - author: Who uploaded the file
+             - created_on: Upload timestamp
+    
+    Example workflow:
+        1. redmine_issue_attachments(1234) -> get list with attachment IDs
+        2. redmine_attachment_get(5678) -> download specific attachment as base64
+    """
+    try:
+        response = request(f"issues/{issue_id}.json?include=attachments", "get")
+        if response["status_code"] != 200:
+            return format_response(response)
+
+        attachments = response["body"].get("issue", {}).get("attachments", [])
+        return format_response({
+            "status_code": 200,
+            "body": {"attachments": attachments},
+            "error": ""
+        })
+    except Exception as e:
+        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
+
+@mcp.tool()
+def redmine_attachment_get(attachment_id: int) -> str:
+    """
+    Download an attachment from Redmine and return its content as base64.
+    
+    This is the recommended way to get file contents in Claude - the base64 data 
+    IS the complete original file, just encoded for text transmission.
+
+    Args:
+        attachment_id: The attachment ID (get this from redmine_issue_attachments)
+
+    Returns:
+        str: Attachment with:
+             - filename: Original filename
+             - content_type: MIME type to know how to handle the content
+             - size: File size in bytes
+             - content_base64: The complete file encoded in base64
+        
+    How to use the content_base64:
+        - Text files (txt, csv, json, xml, md): Decode to read the text directly
+        - Images (png, jpg, gif): Can be displayed or analyzed visually
+        - PDFs: Decode to extract text content
+        - Binary files: Decode to get original bytes
+        
+        To decode in Python: base64.b64decode(content_base64)
+        
+    Example:
+        1. redmine_issue_attachments(1234) -> find attachment ID 5678
+        2. redmine_attachment_get(5678) -> get the file content
+        3. Process the content_base64 based on content_type
+    """
+    try:
+        # Get attachment metadata
+        attachment_response = request(f"attachments/{attachment_id}.json", "get")
+        if attachment_response["status_code"] != 200:
+            return format_response(attachment_response)
+
+        attachment = attachment_response["body"]["attachment"]
+        filename = attachment["filename"]
+        content_type = attachment.get("content_type", "application/octet-stream")
+        filesize = attachment.get("filesize", 0)
+
+        # Download the file content
+        response = request(f"attachments/download/{attachment_id}/{filename}", "get",
+                           content_type="application/octet-stream")
+        if response["status_code"] != 200 or not response["body"]:
+            return format_response(response)
+
+        # Encode content as base64
+        content_base64 = base64.b64encode(response["body"]).decode('ascii')
+
+        return format_response({
+            "status_code": 200,
+            "body": {
+                "filename": filename,
+                "content_type": content_type,
+                "size": filesize,
+                "content_base64": content_base64
+            },
+            "error": ""
+        })
+    except Exception as e:
+        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
+
+@mcp.tool()
+def redmine_attachment_add(filename: str, content_base64: str, description: str = None) -> str:
+    """
+    Upload a file to Redmine using base64 content (works directly from Claude).
+    
+    This is the recommended way to upload files from Claude. The file content must be 
+    provided as base64 - this is how binary data is transmitted over text protocols.
+
+    Args:
+        filename: Name for the file in Redmine (e.g. 'report.pdf', 'data.csv')
+        content_base64: The file content encoded in base64
+        description: Optional description shown in Redmine
+
+    Returns:
+        str: Upload response containing a token in body.upload.token
+        
+    After uploading, attach the file to an issue (two-step process):
+        1. Upload: redmine_attachment_add('report.pdf', '<base64>') -> get token
+        2. Attach: redmine_request('/issues/123.json', 'put', {
+               'issue': {'uploads': [{'token': '<token>', 'filename': 'report.pdf'}]}
+           })
+    
+    To create base64 from text: base64.b64encode(text.encode()).decode()
+    To create base64 from bytes: base64.b64encode(bytes_data).decode()
+    """
+    try:
+        file_content = base64.b64decode(content_base64)
+    except Exception as e:
+        return format_response({"status_code": 0, "body": None, "error": f"Invalid base64 content: {e}"})
+
+    try:
+        params = {'filename': filename}
+        if description:
+            params['description'] = description
+
+        result = request(path='uploads.json', method='post', params=params,
+                         content_type='application/octet-stream', content=file_content)
+        return format_response(result)
+    except Exception as e:
+        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
+
+@mcp.tool()
+def redmine_whoami() -> str:
+    """
+    Show current authentication status and user information.
+    
+    Use this to verify:
+    - If OAuth2 authentication is enabled
+    - Which user is making requests to Redmine (OAuth user or generic API key)
+    - If the OAuth user exists in Redmine and impersonation is active
+
+    Returns:
+        str: Authentication details including:
+             - oauth_enabled: Whether OAuth2 is configured
+             - oauth_user: Username from OAuth2 token (if authenticated)
+             - oauth_user_exists_in_redmine: Whether the OAuth user was found in Redmine
+             - impersonation_active: True if using X-Redmine-Switch-User header
+             - redmine_user: The actual user making requests to Redmine
+             - redmine_api_user: User info from Redmine API (who the API key belongs to)
+    
+    If impersonation_active is False, all actions are recorded as the API key owner,
+    not the OAuth user. This happens when:
+    - OAuth is disabled
+    - OAuth user doesn't exist in Redmine
+    - API key doesn't have admin privileges
+    """
+    try:
+        oauth_user = current_user_var.get()
+        oauth_user_exists = _user_exists_in_redmine(oauth_user) if oauth_user else False
+        
+        # Get the Redmine API key user
+        redmine_response = request("users/current.json", "get")
+        redmine_api_user = None
+        if redmine_response["status_code"] == 200:
+            redmine_api_user = redmine_response["body"].get("user", {})
+        
+        impersonation_active = bool(oauth_user and oauth_user_exists)
+        
+        return format_response({
+            "status_code": 200,
+            "body": {
+                "oauth_enabled": OAUTH_ENABLED,
+                "oauth_user": oauth_user,
+                "oauth_user_exists_in_redmine": oauth_user_exists,
+                "impersonation_active": impersonation_active,
+                "redmine_user": oauth_user if impersonation_active else (redmine_api_user.get("login") if redmine_api_user else "unknown"),
+                "redmine_api_user": {
+                    "id": redmine_api_user.get("id"),
+                    "login": redmine_api_user.get("login"),
+                    "firstname": redmine_api_user.get("firstname"),
+                    "lastname": redmine_api_user.get("lastname"),
+                    "admin": redmine_api_user.get("admin"),
+                } if redmine_api_user else None
+            },
+            "error": ""
+        })
     except Exception as e:
         return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
 
