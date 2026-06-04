@@ -360,6 +360,82 @@ async def oauth_token(request: Request) -> Response:
     return JSONResponse(status_code=kc_response.status_code, content=content)
 
 
+### Direct Download Endpoint ###
+
+async def attachment_download(request: Request) -> Response:
+    """
+    Direct download endpoint for Redmine attachments.
+    
+    URL: /attachments/{attachment_id}/download
+    
+    Authentication:
+    - If OAUTH_ENABLED: requires Bearer token in Authorization header
+    - Otherwise: uses the server's REDMINE_API_KEY directly
+    
+    The impersonation header is added if the OAuth user exists in Redmine.
+    """
+    attachment_id = request.path_params.get("attachment_id")
+    if not attachment_id:
+        return JSONResponse({"error": "attachment_id required"}, status_code=400)
+    
+    try:
+        attachment_id = int(attachment_id)
+    except ValueError:
+        return JSONResponse({"error": "attachment_id must be an integer"}, status_code=400)
+    
+    # Build headers for Redmine request
+    headers = {
+        'X-Redmine-API-Key': REDMINE_API_KEY,
+        **REDMINE_HEADERS
+    }
+    
+    # Add impersonation header if OAuth user is set and exists in Redmine
+    oauth_user = current_user_var.get()
+    if oauth_user:
+        resolved_login = _user_exists_in_redmine(oauth_user)
+        if resolved_login:
+            headers['X-Redmine-Switch-User'] = resolved_login
+    
+    try:
+        # First get attachment metadata
+        meta_url = urljoin(REDMINE_URL, f'attachments/{attachment_id}.json')
+        async with httpx.AsyncClient(timeout=30.0, verify=not REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS) as client:
+            meta_response = await client.get(meta_url, headers=headers)
+            
+            if meta_response.status_code == 404:
+                return JSONResponse({"error": "Attachment not found"}, status_code=404)
+            if meta_response.status_code == 403:
+                return JSONResponse({"error": "Access denied"}, status_code=403)
+            if meta_response.status_code != 200:
+                return JSONResponse({"error": f"Redmine error: {meta_response.status_code}"}, status_code=meta_response.status_code)
+            
+            attachment = meta_response.json().get("attachment", {})
+            filename = attachment.get("filename", f"attachment_{attachment_id}")
+            content_type = attachment.get("content_type", "application/octet-stream")
+            
+            # Download the actual file
+            download_url = urljoin(REDMINE_URL, f'attachments/download/{attachment_id}/{filename}')
+            file_response = await client.get(download_url, headers=headers)
+            
+            if file_response.status_code != 200:
+                return JSONResponse({"error": f"Download failed: {file_response.status_code}"}, status_code=file_response.status_code)
+            
+            # Return file with proper headers for browser download
+            return Response(
+                content=file_response.content,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(file_response.content)),
+                }
+            )
+    except httpx.TimeoutException:
+        return JSONResponse({"error": "Request timeout"}, status_code=504)
+    except Exception as e:
+        get_logger(__name__).error(f"Download error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # Tools - Disable DNS rebinding protection for public deployment
 mcp = FastMCP(
     "Redmine MCP server",
@@ -549,10 +625,13 @@ def redmine_issue_attachments(issue_id: int) -> str:
              - description: User-provided description
              - author: Who uploaded the file
              - created_on: Upload timestamp
+             - download_url: Direct download URL (requires OAuth token if enabled)
     
     Example workflow:
         1. redmine_issue_attachments(1234) -> get list with attachment IDs
         2. redmine_attachment_get(5678) -> download specific attachment as base64
+        
+    Or use the download_url directly in a browser (with OAuth authentication if enabled).
     """
     try:
         response = request(f"issues/{issue_id}.json?include=attachments", "get")
@@ -560,6 +639,13 @@ def redmine_issue_attachments(issue_id: int) -> str:
             return format_response(response)
 
         attachments = response["body"].get("issue", {}).get("attachments", [])
+        
+        # Add download URLs for each attachment
+        for att in attachments:
+            att["download_url"] = f"{MCP_SERVER_URL}/attachments/{att['id']}/download"
+            # Direct Redmine URL with API key (works without OAuth, for Claude Desktop)
+            att["direct_download_url"] = f"{REDMINE_URL}attachments/download/{att['id']}/{att['filename']}?key={REDMINE_API_KEY}"
+        
         return format_response({
             "status_code": 200,
             "body": {"attachments": attachments},
@@ -625,7 +711,9 @@ def redmine_attachment_get(attachment_id: int) -> str:
                 "filename": filename,
                 "content_type": content_type,
                 "size": filesize,
-                "content_base64": content_base64
+                "content_base64": content_base64,
+                "download_url": f"{MCP_SERVER_URL}/attachments/{attachment_id}/download",
+                "direct_download_url": f"{REDMINE_URL}attachments/download/{attachment_id}/{filename}?key={REDMINE_API_KEY}"
             },
             "error": ""
         })
@@ -768,6 +856,7 @@ def main():
             Route("/register", oauth_register, methods=["POST"]),
             Route("/authorize", oauth_authorize, methods=["GET"]),
             Route("/token", oauth_token, methods=["POST"]),
+            Route("/attachments/{attachment_id:int}/download", attachment_download, methods=["GET"]),
         ]
         for route in reversed(oauth_routes):
             app.routes.insert(0, route)
