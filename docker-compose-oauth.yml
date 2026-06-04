@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  mcp-redmine:
+    image: ghcr.io/m-risk/redmine-mcp:7.0.18
+    container_name: mcp-redmine
+    restart: unless-stopped
+    environment:
+      - REDMINE_URL=${REDMINE_URL}
+      - REDMINE_API_KEY=${REDMINE_API_KEY}
+    networks:
+      - mcp-network
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:latest
+    container_name: oauth2-proxy
+    restart: unless-stopped
+    ports:
+      - "8000:4180"
+    environment:
+      - OAUTH2_PROXY_PROVIDER=keycloak-oidc
+      - OAUTH2_PROXY_CLIENT_ID=${OAUTH2_CLIENT_ID}
+      - OAUTH2_PROXY_CLIENT_SECRET=${OAUTH2_CLIENT_SECRET}
+      - OAUTH2_PROXY_REDIRECT_URL=https://redmine-mcp.m-risk.com/oauth2/callback
+      - OAUTH2_PROXY_OIDC_ISSUER_URL=${KEYCLOAK_ISSUER_URL}
+      - OAUTH2_PROXY_COOKIE_SECRET=${OAUTH2_COOKIE_SECRET}
+      - OAUTH2_PROXY_EMAIL_DOMAINS=*
+      - OAUTH2_PROXY_UPSTREAMS=http://mcp-redmine:8000
+      - OAUTH2_PROXY_HTTP_ADDRESS=0.0.0.0:4180
+      - OAUTH2_PROXY_COOKIE_SECURE=true
+      - OAUTH2_PROXY_COOKIE_SAMESITE=lax
+      - OAUTH2_PROXY_SKIP_PROVIDER_BUTTON=true
+    networks:
+      - mcp-network
+    depends_on:
+      - mcp-redmine
+
+networks:
+  mcp-network:
+    driver: bridge

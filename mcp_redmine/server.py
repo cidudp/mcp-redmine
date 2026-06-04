@@ -1,9 +1,19 @@
 import os, yaml, pathlib, json, uuid
 from urllib.parse import urljoin
+from typing import Optional
+
+import time
+import contextvars
+from urllib.parse import urlencode
 
 import httpx
+import jwt
+from jwt import PyJWKClient
+from starlette.responses import JSONResponse, Response, RedirectResponse
+from starlette.requests import Request
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.logging import get_logger
+from mcp.server.transport_security import TransportSecuritySettings
 
 ### Constants ###
 
@@ -18,6 +28,23 @@ with open(current_dir / 'redmine_openapi.yml') as f:
 REDMINE_URL = os.environ['REDMINE_URL'].rstrip('/') + '/'  # Normalize to always end with /
 REDMINE_API_KEY = os.environ['REDMINE_API_KEY']
 REDMINE_RESPONSE_FORMAT = os.environ.get('REDMINE_RESPONSE_FORMAT', 'yaml').lower()
+
+# OAuth Configuration
+OAUTH_ENABLED = os.environ.get('OAUTH_ENABLED', 'false').lower() == 'true'
+OAUTH_ISSUER_URL = os.environ.get('OAUTH_ISSUER_URL', 'https://auth.m-risk.com/auth/realms/mrisk')
+OAUTH_JWKS_URL = f"{OAUTH_ISSUER_URL}/protocol/openid-connect/certs"
+MCP_SERVER_URL = os.environ.get('MCP_SERVER_URL', 'https://redmine-mcp.m-risk.com').rstrip('/')
+
+# OAuth client credentials (static client pre-registered in Keycloak)
+OAUTH_CLIENT_ID = os.environ.get('OAUTH_CLIENT_ID', 'redmine-mcp')
+OAUTH_CLIENT_SECRET = os.environ.get('OAUTH_CLIENT_SECRET', '')
+
+# Keycloak endpoints derived from issuer
+KC_AUTHORIZE_URL = f"{OAUTH_ISSUER_URL}/protocol/openid-connect/auth"
+KC_TOKEN_URL = f"{OAUTH_ISSUER_URL}/protocol/openid-connect/token"
+
+# Holds the authenticated user's login for the duration of a request (impersonation)
+current_user_var = contextvars.ContextVar("current_user", default=None)
 
 # Custom headers (format: "Header1: Value1, Header2: Value2")
 REDMINE_HEADERS = {}
@@ -52,6 +79,10 @@ def request(path: str, method: str = 'get', data: dict = None, params: dict = No
         'Content-Type': content_type,
         **REDMINE_HEADERS
     }
+    # Impersonate the OAuth-authenticated user (requires admin API key in Redmine)
+    switch_user = current_user_var.get()
+    if switch_user:
+        headers['X-Redmine-Switch-User'] = switch_user
     url = urljoin(REDMINE_URL, path.lstrip('/'))
 
     try:
@@ -124,8 +155,166 @@ def validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, 
     return None, path
 
 
-# Tools
-mcp = FastMCP("Redmine MCP server")
+### OAuth Implementation ###
+
+class OAuthMiddleware:
+    """Pure ASGI middleware to validate OAuth tokens (MCP authorization spec).
+
+    Implemented as raw ASGI (not BaseHTTPMiddleware) so it does not buffer
+    streaming SSE responses and so contextvars propagate to tool execution.
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self.jwks_client = PyJWKClient(OAUTH_JWKS_URL) if OAUTH_ENABLED else None
+        if OAUTH_ENABLED:
+            get_logger(__name__).info(f"OAuth enabled with issuer: {OAUTH_ISSUER_URL}")
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        public_paths = ("/.well-known/", "/authorize", "/token", "/register")
+        if not OAUTH_ENABLED or any(path.startswith(p) for p in public_paths):
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        auth_header = headers.get(b"authorization", b"").decode()
+        if not auth_header.startswith("Bearer "):
+            await self._send_unauthorized(send)
+            return
+
+        token = auth_header[7:]
+        try:
+            signing_key = self.jwks_client.get_signing_key_from_jwt(token)
+            decoded = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                issuer=OAUTH_ISSUER_URL,
+                options={"verify_aud": False},
+            )
+        except jwt.ExpiredSignatureError:
+            await self._send_unauthorized(send, error="Token expired")
+            return
+        except jwt.InvalidTokenError as e:
+            await self._send_unauthorized(send, error=f"Invalid token: {e}")
+            return
+        except Exception as e:
+            get_logger(__name__).error(f"OAuth validation error: {e}")
+            await self._send_unauthorized(send, error="Authentication failed")
+            return
+
+        # Set the impersonation user for the duration of this request
+        username = decoded.get("preferred_username") or decoded.get("email")
+        ctx_token = current_user_var.set(username)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            current_user_var.reset(ctx_token)
+
+    async def _send_unauthorized(self, send, error: str = None):
+        """Send a 401 with WWW-Authenticate header per MCP spec."""
+        resource_metadata_url = f"{MCP_SERVER_URL}/.well-known/oauth-protected-resource"
+        body = json.dumps({
+            "error": "unauthorized",
+            "error_description": error or "Authentication required",
+        }).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"www-authenticate", f'Bearer resource_metadata="{resource_metadata_url}"'.encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+### OAuth Proxy Endpoints (bridge Claude.ai DCR flow to Keycloak static client) ###
+
+async def oauth_protected_resource(request: Request) -> Response:
+    """RFC 9728 protected resource metadata. Points to this server as the authorization server."""
+    return JSONResponse({
+        "resource": MCP_SERVER_URL,
+        "authorization_servers": [MCP_SERVER_URL],
+    })
+
+
+async def oauth_authorization_server(request: Request) -> Response:
+    """RFC 8414 authorization server metadata advertising this server's proxy endpoints."""
+    return JSONResponse({
+        "issuer": MCP_SERVER_URL,
+        "authorization_endpoint": f"{MCP_SERVER_URL}/authorize",
+        "token_endpoint": f"{MCP_SERVER_URL}/token",
+        "registration_endpoint": f"{MCP_SERVER_URL}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["openid", "email", "profile", "offline_access"],
+    })
+
+
+async def oauth_register(request: Request) -> Response:
+    """RFC 7591 Dynamic Client Registration. Returns the static Keycloak client_id."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    redirect_uris = body.get("redirect_uris", [])
+    return JSONResponse(status_code=201, content={
+        "client_id": OAUTH_CLIENT_ID,
+        "client_id_issued_at": int(time.time()),
+        "redirect_uris": redirect_uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+    })
+
+
+async def oauth_authorize(request: Request) -> Response:
+    """Redirect the user to Keycloak's authorize endpoint, forcing our static client_id."""
+    params = dict(request.query_params)
+    params["client_id"] = OAUTH_CLIENT_ID
+    if "scope" not in params or "openid" not in params.get("scope", ""):
+        params["scope"] = (params.get("scope", "") + " openid").strip()
+    return RedirectResponse(url=f"{KC_AUTHORIZE_URL}?{urlencode(params)}")
+
+
+async def oauth_token(request: Request) -> Response:
+    """Proxy the token exchange to Keycloak, injecting the confidential client_secret."""
+    form = dict(await request.form())
+    form["client_id"] = OAUTH_CLIENT_ID
+    if OAUTH_CLIENT_SECRET:
+        form["client_secret"] = OAUTH_CLIENT_SECRET
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        kc_response = await client.post(
+            KC_TOKEN_URL,
+            data=form,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    try:
+        content = kc_response.json()
+    except Exception:
+        content = {"error": "invalid_response", "error_description": kc_response.text}
+
+    return JSONResponse(status_code=kc_response.status_code, content=content)
+
+
+# Tools - Disable DNS rebinding protection for public deployment
+mcp = FastMCP(
+    "Redmine MCP server",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    )
+)
 get_logger(__name__).info(f"Starting MCP Redmine version {VERSION}")
 
 @mcp.tool(description="""
@@ -252,17 +441,45 @@ def redmine_download(attachment_id: int, save_path: str, filename: str = None) -
 def main():
     """Main entry point for the mcp-redmine package."""
     import argparse
+    
     parser = argparse.ArgumentParser(description="MCP Redmine Server")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
+    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio",
                         help="Transport type (default: stdio)")
-    parser.add_argument("--host", default="0.0.0.0", help="Host for SSE transport (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="Port for SSE transport (default: 8000)")
+    parser.add_argument("--host", default="0.0.0.0", help="Host for HTTP transport (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="Port for HTTP transport (default: 8000)")
     args = parser.parse_args()
 
-    if args.transport == "sse":
+    if args.transport in ["sse", "streamable-http"]:
+        import uvicorn
+        from starlette.routing import Route
+
         mcp.settings.host = args.host
         mcp.settings.port = args.port
-    mcp.run(transport=args.transport)
+
+        # Get the Starlette app from FastMCP
+        if args.transport == "sse":
+            app = mcp.sse_app()
+        else:
+            app = mcp.streamable_http_app()
+
+        # Add OAuth middleware
+        app.add_middleware(OAuthMiddleware)
+
+        # Register OAuth discovery + proxy routes at the beginning
+        oauth_routes = [
+            Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+            Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+            Route("/.well-known/openid-configuration", oauth_authorization_server),
+            Route("/register", oauth_register, methods=["POST"]),
+            Route("/authorize", oauth_authorize, methods=["GET"]),
+            Route("/token", oauth_token, methods=["POST"]),
+        ]
+        for route in reversed(oauth_routes):
+            app.routes.insert(0, route)
+
+        uvicorn.run(app, host=args.host, port=args.port)
+    else:
+        mcp.run(transport=args.transport)
 
 if __name__ == "__main__":
     main()

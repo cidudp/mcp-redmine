@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  mcp-redmine:
+    image: ghcr.io/m-risk/redmine-mcp:7.0.23
+    container_name: mcp-redmine
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - REDMINE_URL=${REDMINE_URL}
+      - REDMINE_API_KEY=${REDMINE_API_KEY}
+      - OAUTH_ENABLED=${OAUTH_ENABLED:-true}
+      - OAUTH_ISSUER_URL=${OAUTH_ISSUER_URL:-https://auth.m-risk.com/auth/realms/mrisk}
+      - MCP_SERVER_URL=${MCP_SERVER_URL:-https://redmine-mcp.m-risk.com}
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-redmine-mcp}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET}

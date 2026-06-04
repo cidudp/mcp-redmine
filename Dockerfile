@@ -8,4 +8,4 @@ RUN pip install --upgrade pip \
     && pip install uv \
     && uv sync
 
-CMD ["uv", "run", "--directory", "/app", "-m", "mcp_redmine.server", "main"]
+CMD ["uv", "run", "--directory", "/app", "-m", "mcp_redmine.server", "--transport", "sse", "--host", "0.0.0.0", "--port", "8000"]
