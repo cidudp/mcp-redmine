@@ -46,8 +46,8 @@ KC_TOKEN_URL = f"{OAUTH_ISSUER_URL}/protocol/openid-connect/token"
 # Holds the authenticated user's login for the duration of a request (impersonation)
 current_user_var = contextvars.ContextVar("current_user", default=None)
 
-# Cache of verified Redmine users (login -> exists)
-_verified_users_cache: dict[str, bool] = {}
+# Cache of verified Redmine users (oauth_user -> resolved_login or None)
+_verified_users_cache: dict[str, str | None] = {}
 
 # Custom headers (format: "Header1: Value1, Header2: Value2")
 REDMINE_HEADERS = {}
@@ -75,27 +75,51 @@ else:
 
 
 # Core
-def _user_exists_in_redmine(login: str) -> bool:
-    """Check if user exists in Redmine. Results are cached."""
-    if login in _verified_users_cache:
-        return _verified_users_cache[login]
+def _user_exists_in_redmine(login_or_email: str) -> str | None:
+    """Check if user exists in Redmine by login or email. Results are cached.
+    
+    Args:
+        login_or_email: Username or email to search for
+        
+    Returns:
+        The Redmine login if found (exactly one match), None otherwise.
+        If searching by email and multiple users share the same email, returns None.
+    """
+    if login_or_email in _verified_users_cache:
+        return _verified_users_cache[login_or_email]
     
     try:
-        url = urljoin(REDMINE_URL, f'users.json?name={login}&limit=100')
+        # Search by name (matches login, firstname, lastname, and email)
+        url = urljoin(REDMINE_URL, f'users.json?name={login_or_email}&limit=100')
         response = httpx.get(url, headers={'X-Redmine-API-Key': REDMINE_API_KEY},
                             timeout=10.0, verify=not REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS)
         if response.status_code == 200:
             users = response.json().get('users', [])
-            exists = any(u.get('login') == login for u in users)
-            _verified_users_cache[login] = exists
-            if not exists:
-                get_logger(__name__).warning(f"User '{login}' from OAuth not found in Redmine, skipping impersonation")
-            return exists
+            
+            # First, try exact login match
+            for user in users:
+                if user.get('login') == login_or_email:
+                    _verified_users_cache[login_or_email] = user.get('login')
+                    return user.get('login')
+            
+            # If no login match, try exact email match
+            email_matches = [u for u in users if u.get('mail') == login_or_email]
+            if len(email_matches) == 1:
+                resolved_login = email_matches[0].get('login')
+                get_logger(__name__).info(f"User '{login_or_email}' matched by email to Redmine user '{resolved_login}'")
+                _verified_users_cache[login_or_email] = resolved_login
+                return resolved_login
+            elif len(email_matches) > 1:
+                get_logger(__name__).warning(f"Email '{login_or_email}' matches multiple Redmine users, skipping impersonation")
+                _verified_users_cache[login_or_email] = None
+                return None
+            
+            get_logger(__name__).warning(f"User '{login_or_email}' from OAuth not found in Redmine, skipping impersonation")
     except Exception as e:
-        get_logger(__name__).error(f"Failed to verify user '{login}' in Redmine: {e}")
+        get_logger(__name__).error(f"Failed to verify user '{login_or_email}' in Redmine: {e}")
     
-    _verified_users_cache[login] = False
-    return False
+    _verified_users_cache[login_or_email] = None
+    return None
 
 def request(path: str, method: str = 'get', data: dict = None, params: dict = None,
             content_type: str = 'application/json', content: bytes = None) -> dict:
@@ -106,9 +130,11 @@ def request(path: str, method: str = 'get', data: dict = None, params: dict = No
     }
     # Impersonate the OAuth-authenticated user (requires admin API key in Redmine)
     # Only add header if user exists in Redmine, otherwise skip silently
-    switch_user = current_user_var.get()
-    if switch_user and _user_exists_in_redmine(switch_user):
-        headers['X-Redmine-Switch-User'] = switch_user
+    oauth_user = current_user_var.get()
+    if oauth_user:
+        resolved_login = _user_exists_in_redmine(oauth_user)
+        if resolved_login:
+            headers['X-Redmine-Switch-User'] = resolved_login
     url = urljoin(REDMINE_URL, path.lstrip('/'))
 
     try:
@@ -660,8 +686,9 @@ def redmine_whoami() -> str:
     Returns:
         str: Authentication details including:
              - oauth_enabled: Whether OAuth2 is configured
-             - oauth_user: Username from OAuth2 token (if authenticated)
-             - oauth_user_exists_in_redmine: Whether the OAuth user was found in Redmine
+             - oauth_user: Username/email from OAuth2 token (if authenticated)
+             - oauth_user_exists_in_redmine: Whether the OAuth user was found in Redmine (by login or email)
+             - resolved_redmine_login: The Redmine login resolved from oauth_user (may differ if matched by email)
              - impersonation_active: True if using X-Redmine-Switch-User header
              - redmine_user: The actual user making requests to Redmine
              - redmine_api_user: User info from Redmine API (who the API key belongs to)
@@ -674,7 +701,7 @@ def redmine_whoami() -> str:
     """
     try:
         oauth_user = current_user_var.get()
-        oauth_user_exists = _user_exists_in_redmine(oauth_user) if oauth_user else False
+        resolved_login = _user_exists_in_redmine(oauth_user) if oauth_user else None
         
         # Get the Redmine API key user
         redmine_response = request("users/current.json", "get")
@@ -682,16 +709,17 @@ def redmine_whoami() -> str:
         if redmine_response["status_code"] == 200:
             redmine_api_user = redmine_response["body"].get("user", {})
         
-        impersonation_active = bool(oauth_user and oauth_user_exists)
+        impersonation_active = bool(oauth_user and resolved_login)
         
         return format_response({
             "status_code": 200,
             "body": {
                 "oauth_enabled": OAUTH_ENABLED,
                 "oauth_user": oauth_user,
-                "oauth_user_exists_in_redmine": oauth_user_exists,
+                "oauth_user_exists_in_redmine": resolved_login is not None,
+                "resolved_redmine_login": resolved_login,
                 "impersonation_active": impersonation_active,
-                "redmine_user": oauth_user if impersonation_active else (redmine_api_user.get("login") if redmine_api_user else "unknown"),
+                "redmine_user": resolved_login if impersonation_active else (redmine_api_user.get("login") if redmine_api_user else "unknown"),
                 "redmine_api_user": {
                     "id": redmine_api_user.get("id"),
                     "login": redmine_api_user.get("login"),
